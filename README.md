@@ -1,4 +1,5 @@
 # WatDFS — A Simplified Distributed File System
+![project cover](assets/screenshots/cover.png)
 
 **A FUSE-based distributed file system in C/C++, featuring RPC communication, client-side caching, consistency checks, and multi-client concurrency control.**
 
