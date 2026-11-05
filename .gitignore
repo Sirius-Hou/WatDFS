@@ -1,0 +1,11 @@
+*.o
+*.d
+*.log
+*.zip
+**/watdfs_client
+**/watdfs_server
+**/libwatdfs.a
+__pycache__/
+.depend
+/results/
+.DS_Store
