@@ -2,10 +2,11 @@
 *.d
 *.log
 *.zip
-**/watdfs_client
-**/watdfs_server
-**/libwatdfs.a
-__pycache__/
+watdfs_client
+watdfs_server
+libwatdfs.a
+baseline/watdfs_client
+baseline/watdfs_server
+baseline/libwatdfs.a
 .depend
-/results/
 .DS_Store

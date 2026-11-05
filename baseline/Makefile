@@ -17,19 +17,18 @@ WATDFS_SERVER_OBJS = watdfs_server.o
 # WATDFS_SERVER_FILES and WATDFS_SERVER_OBJS respectively.
 
 CXX = g++
-LIBDIR = ../lib
 
 # Add the required fuse library includes.
 CXXFLAGS += $(shell pkg-config --cflags fuse)
-CXXFLAGS += -g -Wall -std=c++1y -MMD -pthread
+CXXFLAGS += -g -Wall -std=c++1y -MMD
 # If you want to disable logging messages from DLOG, uncomment the next line.
 #CXXFLAGS += -DNDEBUG
 
 # Add fuse libraries.
-LDFLAGS += $(shell pkg-config --libs fuse) -pthread
+LDFLAGS += $(shell pkg-config --libs fuse)
 
 # Dependencies for the client executable.
-WATDFS_CLIENT_LIBS = $(LIBDIR)/libwatdfsmain.a libwatdfs.a $(LIBDIR)/librpc.a
+WATDFS_CLIENT_LIBS = libwatdfsmain.a libwatdfs.a librpc.a
 
 OBJECTS = $(WATDFS_SERVER_OBJS) $(WATDFS_CLI_OBJS)
 DEPENDS = $(OBJECTS:.o=.d)
@@ -45,7 +44,7 @@ all: libwatdfs.a watdfs_server watdfs_client
 # This compiles object files, by default it looks for .c files
 # so you may want to change this depending on your file naming scheme.
 %.o: %.c
-	$(CXX) $(CXXFLAGS) -c $(LDFLAGS) -L$(LIBDIR) -lrpc $<
+	$(CXX) $(CXXFLAGS) -c $(LDFLAGS) -L. -lrpc $<
 
 # Make the client library.
 libwatdfs.a: $(WATDFS_CLI_OBJS)
@@ -53,11 +52,11 @@ libwatdfs.a: $(WATDFS_CLI_OBJS)
 
 # Make the server executable.
 watdfs_server: $(WATDFS_SERVER_OBJS)
-	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -L$(LIBDIR) -lrpc -o $@
+	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -L. -lrpc -o $@
 
 # Make the client executable.
 watdfs_client: $(WATDFS_CLIENT_LIBS)
-	$(CXX) $(CXXFLAGS) -o watdfs_client -L. -L$(LIBDIR) -lwatdfsmain -lwatdfs -lrpc $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) -o watdfs_client -L. -lwatdfsmain -lwatdfs -lrpc $(LDFLAGS)
 
 # Add dependencies so object files are tracked in the correct order.
 depend:

@@ -1,91 +1,178 @@
 # WatDFS — A Simplified Distributed File System
 
-A C++ distributed filesystem built for the University of Waterloo's CS 454/654 Distributed Systems course. Applications access remote files through ordinary filesystem calls, while a FUSE client manages a local whole-file cache and communicates with a central server through RPC.
+**A FUSE-based distributed file system built in C/C++, featuring RPC communication, client-side caching, consistency checks, and concurrency control.**
 
-The main implementation combines remote file access, timeout-based cache validation, writeback, and coordinated file transfers. An earlier remote-access implementation is retained as a performance baseline.
+WatDFS provides a transparent interface for accessing files stored on a remote server through standard Linux file operations. Applications can interact with a mounted directory using familiar system calls—such as `open`, `read`, `write`, and `close`—while WatDFS manages remote communication, local file caching, and synchronization behind the scenes.
+
+Built as part of the University of Waterloo's **CS 454/654: Distributed Systems** course, the project evolved from an RPC-based remote-access file system into an **upload/download architecture** that performs file operations on locally cached copies while coordinating consistency across multiple clients.
+
+## Highlights
+
+- **Transparent file access with FUSE:** Exposes remote files through a mounted Linux directory without requiring application-level changes or kernel modifications.
+- **RPC-based client–server communication:** Translates file operations into remote procedure calls, with a centralized server managing persistent files.
+- **Local disk caching:** Downloads files on demand and performs subsequent operations on client-side cached copies, reducing the need to transfer file contents for every operation.
+- **Timeout-based cache validation:** Uses a configurable freshness interval and file modification timestamps to determine when cached data can be reused or must be refreshed.
+- **Write-back synchronization:** Applies writes locally and propagates modifications to the server on synchronization events, including `fsync` and file release.
+- **Multi-client concurrency control:** Allows multiple readers while enforcing single-writer access, with safeguards against conflicting opens.
+- **Atomic file transfers:** Coordinates uploads and downloads with reader–writer locking so clients do not observe partially transferred file contents.
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    App[Application: POSIX file operations] --> FUSE[FUSE / course client runtime]
-    FUSE --> Client[WatDFS client]
-    Client <--> Cache[Local whole-file cache]
-    Client <-->|RPC: operations and transfer locks| Server[WatDFS server]
-    Server <--> Storage[Server backing directory]
+```text
+                        Linux Applications
+                     (open / read / write / stat)
+                                 |
+                                 v
+                         Linux VFS / FUSE
+                                 |
+                 +---------------v----------------+
+                 |          WatDFS Client          |
+                 |                                |
+                 |  File operations & open state  |
+                 |  Timeout-based freshness check |
+                 |  Local disk cache              |
+                 +----------+---------------------+
+                            |
+                       RPC requests
+                            |
+                 +----------v---------------------+
+                 |          WatDFS Server          |
+                 |                                |
+                 |  RPC handlers                  |
+                 |  Write-access coordination     |
+                 |  Atomic transfer locks         |
+                 |  Local filesystem operations   |
+                 +----------+---------------------+
+                            |
+                            v
+                  Persistent Server Files
 ```
 
-On open, the client obtains a server file handle and downloads a complete file into its cache. Reads and writes then use the local copy. After the configured freshness interval, subsequent operations check modification times and refresh or upload the file as appropriate. Explicit `fsync` and writable-file release upload the cached contents to the server.
+Each client exposes a FUSE mount point to applications and maintains a separate on-disk cache. The server is the shared backing store and coordinates access across clients. The design separates application-facing filesystem operations from remote storage and consistency management.
 
-## Implemented features
+## Core Features
 
-| Capability | Implementation |
+### 1. Filesystem operations through FUSE
+
+WatDFS integrates with Linux's Filesystem in Userspace (FUSE) interface, allowing standard filesystem requests to pass through a user-space client implementation. The supported operations include:
+
+| Category | Operations |
 | --- | --- |
-| Transparent file access | FUSE callbacks for `getattr`, `mknod`, `open`, `release`, `read`, `write`, `truncate`, `fsync`, and timestamp updates |
-| Remote operations | RPC argument marshaling, server dispatch, file handles, offset-based I/O, and negative-errno propagation |
-| Large transfers | Files transferred in chunks respecting the RPC library's 65,535-byte array limit |
-| Whole-file caching | Local disk copies serve reads and writes after the initial download |
-| Freshness checks | Configurable timeout and modification-time comparison; stale read-only copies are downloaded again |
-| Writeback | Operation-triggered writeback after expiry, explicit `fsync`, and writable-file close |
-| Open coordination | Multiple readers and at most one writer per file across clients; duplicate opens in one client are rejected |
-| Transfer coordination | Per-file reader/writer locks coordinate complete uploads and downloads; the submitted lock implementation gives waiting writers priority |
-| Comparison baseline | Earlier implementation forwards file operations to the server without the whole-file client cache |
+| File lifecycle | `mknod`, `open`, `release` |
+| Data access | `read`, `write`, `truncate` |
+| Metadata | `getattr`, `utimensat` |
+| Synchronization | `fsync` |
 
-Readers may coexist with a writer. Writer admission and transfer locking are separate mechanisms: admitting a writer does not block every reader for the lifetime of the open file.
+The client maps these operations to local system calls and RPC communication as needed, preserving a familiar filesystem interface for applications.
 
-## Build and run
+### 2. RPC communication and remote storage
 
-Requires a compatible Linux environment, a C++14 compiler, Make, `pkg-config`, FUSE **2** development files, and the bundled course static libraries. Python 3 is used only by the validation tools.
+WatDFS uses a client–server architecture to coordinate file access over RPC:
+
+1. An application invokes an operation on a file in the FUSE mount.
+2. The WatDFS client handles the request, consulting its cache or communicating with the server.
+3. The server performs the required storage or coordination operation against its local filesystem.
+4. Results, metadata, and file contents are returned to the client as appropriate.
+
+The initial remote-access implementation forwarded file operations to the server. The final design builds on that foundation with an upload/download model and local execution of file operations.
+
+### 3. Client-side caching and consistency
+
+WatDFS maintains **file-backed caches on each client** rather than holding file contents solely in memory.
+
+- **On open:** The client makes the file available locally, downloading it when necessary.
+- **On read:** A cached copy can be reused within the configured freshness interval. After the interval expires, the client compares modification timestamps with the server and refreshes the file if it has changed.
+- **On write:** Changes are applied to the local file and synchronized back to the server according to the write-back freshness policy.
+- **On `fsync` or release:** Pending file modifications are flushed to the server; cached copies remain available for later access.
+
+The cache interval is configurable through `CACHE_INTERVAL_SEC`. This is a **timeout-based consistency model**, not a claim of instantaneous consistency between independently cached clients.
+
+### 4. Concurrent access and atomic transfers
+
+WatDFS supports multiple clients connected to the same server while coordinating conflicting file operations:
+
+- **Multiple readers:** Different clients may open the same file for reading concurrently.
+- **Single writer:** At most one client may hold a write-mode open on a given file; competing write opens are rejected.
+- **Per-client open tracking:** The client prevents duplicate opens of the same file within that client instance.
+- **Atomic transfers:** Reader–writer synchronization prevents a download from observing an upload in a partially completed state.
+
+These controls protect file contents during concurrent access and cross-client transfers, without requiring a fully general distributed transaction protocol.
+
+## Repository Layout
+
+The root directory contains the final cached implementation from the P2 submission. The `baseline/` directory contains the final P1 remote-access implementation for reference and comparison only. Running `make` in the repository root does not build or run the baseline; it is used only if you explicitly enter `baseline/` or invoke `make -C baseline`.
+
+## Technology Stack
+
+- **Languages:** C / C++-compatible systems programming interfaces
+- **Platform:** Linux
+- **Filesystem interface:** FUSE (Filesystem in Userspace)
+- **Communication:** Remote Procedure Calls (RPC)
+- **Concurrency:** Reader–writer locks and per-file access tracking
+- **Storage:** Local filesystem-backed server storage and client caches
+- **Build:** GNU Make
+
+## Build and Run
+
+> Requires the Linux/FUSE environment and the course-provided `librpc.a` and `libwatdfsmain.a` support libraries. These libraries are not included in this repository because they are course-provided binaries rather than project source. Copy them into the repository root before building.
 
 ```bash
-git clone https://github.com/Sirius-Hou/WatDFS.git
-cd WatDFS
 make clean all
-make -C baseline clean all
 ```
 
-Use `make all`: the inherited default target does not build the client executable.
+**Start the server** in one terminal:
 
-1. Start `watdfs_server` with a dedicated backing directory.
-2. Export the `SERVER_ADDRESS` and `SERVER_PORT` printed by that server.
-3. Set `CACHE_INTERVAL_SEC` and start `watdfs_client -s -f -o direct_io CACHE MOUNT`.
-4. Access known file paths inside the mount with ordinary file operations.
-
-See the [school-server runbook](docs/RUNNING.md) for complete terminal-by-terminal commands, multi-client checks, and safe shutdown. See the [benchmark guide](docs/BENCHMARKING.md) for reproducible comparisons and screenshot suggestions.
-
-## Repository layout
-
-```text
-.
-├── watdfs_client.cpp / .h    Cached client implementation and interface
-├── watdfs_server.cpp        RPC server and per-file coordination
-├── rw_lock.cpp / .h         Submitted reader/writer lock
-├── rpc.h, debug.h           Course interfaces and logging support
-├── Makefile
-├── baseline/                Original remote-access implementation
-├── lib/                     Course-provided RPC and FUSE runtime archives
-├── tests/                   Functional checks, benchmark, and tooling self-tests
-└── docs/                    Runbook, benchmarking, provenance, and validation
+```bash
+mkdir -p /tmp/$USER/watdfs-server
+./watdfs_server /tmp/$USER/watdfs-server
 ```
 
-The [provenance notes](docs/PROVENANCE.md) distinguish the implementation work from the course framework. The RPC transport and FUSE entry-point libraries were provided by the course; they were not implemented from scratch for this project.
+The server prints `SERVER_ADDRESS` and `SERVER_PORT`. In another terminal, set them to the values printed by your server, then start the client:
 
-## Results and validation
+```bash
+export SERVER_ADDRESS=<server-hostname>
+export SERVER_PORT=<server-port>
+export CACHE_INTERVAL_SEC=5
 
-Both course submissions passed all course tests at the time of submission, as reported by the author. That historical result is separate from the checks performed while preparing this repository.
+mkdir -p /tmp/$USER/watdfs-cache /tmp/$USER/watdfs-mount
+./watdfs_client -s -f -o direct_io \
+  /tmp/$USER/watdfs-cache \
+  /tmp/$USER/watdfs-mount
+```
 
-Current checks and their environment are recorded in [Validation](docs/VALIDATION.md). Performance measurements on the school servers are pending. This repository includes tools to collect actual results rather than a claimed speedup without measurements.
+**Use the mounted filesystem** from a third terminal:
 
-## Design boundaries
+```bash
+printf 'Hello from WatDFS!\n' > /tmp/$USER/watdfs-mount/hello.txt
+cat /tmp/$USER/watdfs-mount/hello.txt
+stat /tmp/$USER/watdfs-mount/hello.txt
+```
 
-- This is an educational, single-server filesystem, not a production storage service.
-- The supported interface covers basic file operations, not directory listing/creation, rename, or unlink through the mount. Use known filenames; do not use `ls` on the mount as a health check.
-- Each client runs single-threaded (`-s`); multiple client instances can connect to a server.
-- Every open downloads the file again. Cache reuse applies while a file remains open, not indefinitely across separate `cat` commands.
-- Cache expiry is checked during operations, not by a background refresh thread. Visibility is timeout-based rather than strict POSIX coherence across clients.
-- Transfer locks coordinate participating clients. They do not provide transactional rollback, crash recovery, replication, or recovery of locks after a client failure. Direct edits to the backing directory bypass that coordination.
-- `close` may return before FUSE completes `release`; use `fsync` when an explicit synchronization point is needed.
-- Whole-file transfers trade network cost at open/writeback for cheaper repeated local access. They can be expensive for large files or short-lived opens.
-- Bundled static libraries depend on the course runtime ABI. Compatibility must be checked on the intended Linux host.
+Multiple clients can connect to the same server using separate cache and mount directories. The filesystem focuses on file operations; arbitrary directory operations are outside the supported scope.
 
-No blanket open-source license is applied to course-provided components; see [Provenance](docs/PROVENANCE.md).
+## Validation and Performance
+
+The completed project passed the course's automated tests across both development stages. The tested behavior includes standard file operations, cache freshness, write synchronization, multi-client access restrictions, and atomic transfers.
+
+For a reproducible showcase, the following measurements can be collected on the target Linux environment:
+
+| Evaluation | What it demonstrates | Result |
+| --- | --- | --- |
+| End-to-end file operations | Correct file creation, reads, writes, and metadata access | Passed course tests |
+| Binary data integrity | Matching checksums across client and server | To benchmark |
+| Cold vs. warm read | Impact of client-side file caching | To benchmark |
+| Cache expiration | Refresh of stale client data after server updates | Passed course tests |
+| Concurrent access | Multiple readers and rejection of conflicting writers | Passed course tests |
+| Atomic transfer | No partially transferred file contents observed by readers | Passed course tests |
+
+<!-- Optional: Add measured latency / throughput results and screenshots after running benchmarks.
+![Read latency comparison](assets/read-performance.png)
+-->
+
+## Scope and Design Trade-offs
+
+WatDFS is an educational distributed filesystem prototype rather than a production replacement for NFS or a fault-tolerant distributed storage platform. Its core focus is on **filesystem transparency, RPC boundaries, caching, consistency, and concurrency**. It supports the designated file operations, rather than a complete POSIX filesystem API, and uses a centralized backing server rather than replication or distributed consensus.
+
+## Acknowledgments
+
+Developed for **CS 454/654 — Distributed Systems, University of Waterloo**. The project uses course-provided FUSE integration and RPC support components; the WatDFS client/server logic was implemented as part of the course project.
